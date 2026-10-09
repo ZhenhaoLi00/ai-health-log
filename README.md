@@ -75,6 +75,51 @@ All text in this repo is English by convention.
 6. **Confirm before writing back** to any third-party API: show the change
    summary first and wait for the user's OK.
 
+## Build a local dashboard with AI (optional)
+
+You can ask **Muse, Claude Code, Codex, or another coding assistant with access
+to your local files** to turn your private health log into a visual dashboard.
+No hosted dashboard service or dedicated app is required: your private Git
+repository remains the source of truth, and the dashboard reads the data
+locally.
+
+A dashboard could show training frequency and volume, weight trends, meal
+calorie/protein estimates, sleep duration, and data coverage. Missing or
+estimated values must be labeled rather than presented as measurements.
+
+**Copy/paste this prompt into your coding assistant:**
+
+```text
+I have a private health-log repository based on:
+https://github.com/ZhenhaoLi00/ai-health-log
+
+Please build a local-only health dashboard from my existing files.
+First read README.md, AGENTS.md, profile.md, SUMMARY.md (if present),
+and the formats in data/daily/, data/workouts/, data/meals/,
+and data/metrics/. Do not assume any data source is complete.
+
+Requirements:
+- Show useful daily/weekly/monthly views of training, body metrics,
+  nutrition and sleep, with date filters and clear trend charts.
+- Indicate source, units, missing records and estimated values.
+- Use a lightweight local app (for example, Streamlit) with clear
+  setup and run commands. Prefer a read-only data layer.
+- Keep all personal health data on my machine: no hosting, telemetry,
+  external analytics, API uploads, remote dashboards or CDN resources.
+- Do not alter any source health logs, generated reports or API keys.
+  Place new code in dashboard/; keep personal data out of the code.
+- Work gracefully when some categories have no records yet.
+- Add a short README for running and extending the dashboard.
+
+Show me the proposed file changes and any new dependencies before
+installing software or modifying my repository.
+```
+
+Run the dashboard against a **private clone** containing your real records,
+not against the public template. A local dashboard does not make an AI
+assistant's access to your files private: review each assistant's permissions
+and data-handling policy before granting it access to sensitive information.
+
 ## Data sources
 
 | Source | What | How |
