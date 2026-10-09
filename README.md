@@ -9,6 +9,33 @@ below — so you never have to repeat your context to a new assistant.
 > keep that repo **private** — it will hold your real body data. Never commit
 > API keys or tokens; see [SETUP.md](SETUP.md).
 
+## Set up with your AI
+
+Copy everything between the lines and paste it into any AI assistant
+(ChatGPT, Claude, Codex, Muse, ...). It will walk you through the whole setup.
+
+---
+
+I want to set up my own AI health log from this template:
+https://github.com/ZhenhaoLi00/ai-health-log
+
+Please:
+1. Read README.md and SETUP.md in the template repo first.
+2. Ask me for: my timezone, height, current weight, primary goal (fat loss /
+   muscle gain / maintenance), daily protein and calorie targets (suggest them
+   if I don't know), training frequency, and which training app I use
+   (e.g. 训记/Xunji, Apple Health, or manual logging).
+3. Walk me through each step: creating a PRIVATE repo from the template,
+   filling in profile.md, getting my training app's API key and storing it
+   outside the repo (chmod 600), configuring git access (deploy key or PAT),
+   running scripts/health-daily-sync.py, and scheduling it to run daily.
+4. Follow the repo conventions: never commit secrets, cache API responses by
+   date (never re-fetch the same date twice in one day), and always show me a
+   change summary and wait for my confirmation before writing anything back
+   to a third-party API.
+
+---
+
 ## Why we built this
 
 Inspired by [this interview](https://www.youtube.com/watch?v=0Z-vhBvBmUY)
@@ -16,25 +43,6 @@ Inspired by [this interview](https://www.youtube.com/watch?v=0Z-vhBvBmUY)
 AI manage your diet, training and sleep came up. We liked the idea but not the
 lock-in: instead of one app owning the data, a plain Git repo is the single
 source of truth, and every AI assistant reads and writes the same files.
-
-## Our experience (so far)
-
-- **2026-10** — set up a private repo with this exact structure. A deploy key
-  (write access, limited to that one repo) lets automation push without
-  logging into a personal GitHub account.
-- **Training data** comes from the 训记 (Xunji) workout app's Open API, pulled
-  once a day by `scripts/health-daily-sync.py`. One request per date is cached,
-  so the API is never hammered.
-- **Apple Health** (runs, badminton, gym sessions, sleep) syncs through the
-  assistant's HealthKit connector — any workout written to Apple Health shows
-  up automatically, no matter which app recorded it.
-- **Meals** are logged by simply telling the assistant what you ate; it
-  estimates calories/protein and writes `data/meals/`.
-- `SUMMARY.md` (regenerated daily) is the human-readable overview: overall
-  stats plus a recent-days table. Open it on GitHub and you see everything.
-- One rule proved important: **show the diff, then write**. The assistant
-  always presents a change summary and waits for confirmation before writing
-  anything back to a third-party API.
 
 ## Repository layout
 
