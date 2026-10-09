@@ -1,279 +1,318 @@
 #!/usr/bin/env python3
-"""Daily sync: pull Xunji training data into your health log repo.
+"""Sync Xunji workouts into a private, AI-readable health-log repository.
 
-Configuration (environment variables):
-  HEALTH_LOG_REPO      Local clone of your health log repo.
-                       Default: the repo containing this script.
-  XUNJI_API_KEY_FILE   File holding your Xunji Open API key (chmod 600).
-                       Default: ~/.config/xunji/api_key
-  HEALTH_LOG_TZ        Your timezone, e.g. America/Chicago.
-                       Default: system local time.
-  GIT_SSH_COMMAND      Optional custom ssh command (e.g. for a deploy key).
-
-What it does:
-- git pull --rebase
-- Fetches yesterday + today from Xunji (light read), cached by date
-  (a date already fetched today is skipped).
-- Saves raw JSON to data/workouts/YYYY-MM-DD.json
-- Updates the ## Training section of data/daily/YYYY-MM-DD.md
-- Writes a short report to reports/daily/YYYY-MM-DD.md
-- Regenerates SUMMARY.md
-- Commits + pushes only when something changed.
-
-Rate limits: light reads >= 15s apart (we sleep 16s between calls).
+Only the fenced Xunji block inside a daily Training section is managed by
+this script. User-authored notes and other sections are preserved.
 """
-import datetime
-import glob
+from __future__ import annotations
+
+import argparse
+import datetime as dt
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import time
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
-REPO = os.environ.get(
-    "HEALTH_LOG_REPO",
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-KEY_FILE = os.path.expanduser(os.environ.get(
-    "XUNJI_API_KEY_FILE", "~/.config/xunji/api_key"))
-TZ = os.environ.get("HEALTH_LOG_TZ", "")
+REPO = Path(os.environ.get("HEALTH_LOG_REPO", Path(__file__).resolve().parent.parent)).expanduser().resolve()
+KEY_FILE = Path(os.environ.get("XUNJI_API_KEY_FILE", "~/.config/xunji/api_key")).expanduser()
+TIMEZONE = os.environ.get("HEALTH_LOG_TZ", "")
 API = "https://trains.xunjiapp.cn/api_trains_for_llm_v2"
+START_MARKER = "<!-- BEGIN XUNJI SYNC -->"
+END_MARKER = "<!-- END XUNJI SYNC -->"
+TRAINING_SECTION = re.compile(r"(?ms)^## Training\n.*?(?=^## |\Z)")
 
 
-def sh(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
+def local_now() -> dt.datetime:
+    """Use a single timezone for dates and cache timestamps."""
+    return dt.datetime.now(ZoneInfo(TIMEZONE)) if TIMEZONE else dt.datetime.now().astimezone()
 
 
-def _date_cmd(offset_days=0):
-    base = ["date", "+%F"] if not offset_days else \
-        ["date", "-d", f"{offset_days} day", "+%F"]
-    env = dict(os.environ)
-    if TZ:
-        env["TZ"] = TZ
-    return subprocess.run(base, capture_output=True, text=True, env=env).stdout.strip()
+def today() -> dt.date:
+    return local_now().date()
 
 
-def today():
-    return _date_cmd(0)
-
-
-def fetch(datestr, key):
-    out = os.path.join(REPO, "data", "workouts", f"{datestr}.json")
-    if os.path.exists(out):
-        mdate = datetime.date.fromtimestamp(os.path.getmtime(out)).isoformat()
-        if mdate >= today():
-            print(f"skip {datestr} (already fetched today)")
-            return out
-    time.sleep(16)
-    body = json.dumps(
-        {"schema_version": "train_open_api_v2", "datestr": datestr,
-         "include_full_data": False}
-    )
-    r = subprocess.run(
-        ["curl", "-s", "--compressed", "--max-time", "30", "-X", "POST", API,
-         "-H", f"Authorization: Bearer {key}",
-         "-H", "Content-Type: application/json",
-         "-H", "Accept-Encoding: gzip",
-         "-d", body],
-        capture_output=True, text=True)
+def atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = None
     try:
-        data = json.loads(r.stdout)
-    except Exception as e:
-        print(f"fetch {datestr}: bad response ({e})")
-        return None
-    if isinstance(data.get("res"), str):
-        print(f"fetch {datestr}: API error: {data.get('res')}")
-        return None
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    with open(out, "w") as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
-    print(f"fetched {datestr}")
-    return out
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                         prefix=".health-log-", delete=False) as f:
+            temp_name = f.name
+            f.write(content)
+        os.replace(temp_name, path)
+    finally:
+        if temp_name and os.path.exists(temp_name):
+            os.unlink(temp_name)
 
 
-def summarize(path):
-    with open(path) as f:
-        data = json.load(f)
-    trains = data.get("res", {}).get("trains", [])
+def validate_response(data: object) -> dict:
+    """Reject malformed/error API responses before they enter the cache."""
+    if not isinstance(data, dict):
+        raise ValueError("response must be a JSON object")
+    if data.get("success") is False:
+        raise ValueError("API returned success=false")
+    result = data.get("res")
+    if not isinstance(result, dict) or not isinstance(result.get("trains"), list):
+        raise ValueError("response must contain res.trains (list)")
+    return data
+
+
+def fetch_workouts(day: dt.date, key: str, force: bool = False) -> Path:
+    dest = REPO / "data" / "workouts" / f"{day.isoformat()}.json"
+    if dest.exists() and not force:
+        cached_day = dt.datetime.fromtimestamp(dest.stat().st_mtime,
+                                                tz=local_now().tzinfo).date()
+        if cached_day == today():
+            try:
+                validate_response(json.loads(dest.read_text(encoding="utf-8")))
+            except ValueError:
+                print(f"invalid cache, refreshing {day}")
+            else:
+                print(f"cached {day}")
+                return dest
+
+    request_body = json.dumps({
+        "schema_version": "train_open_api_v2",
+        "datestr": day.isoformat(),
+        "include_full_data": False,
+    }).encode("utf-8")
+    request = Request(API, data=request_body, method="POST", headers={
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+    })
+    # urllib avoids exposing the API token through curl command-line arguments.
+    try:
+        with urlopen(request, timeout=30) as response:
+            raw = response.read()
+            if response.headers.get("Content-Encoding", "").lower() == "gzip":
+                import gzip
+                raw = gzip.decompress(raw)
+            data = validate_response(json.loads(raw.decode("utf-8")))
+    except (HTTPError, URLError, OSError, ValueError, UnicodeError) as exc:
+        # Do not print the token, request headers, or raw server responses.
+        raise RuntimeError(f"Xunji fetch failed for {day}: {type(exc).__name__}") from None
+
+    atomic_write(dest, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    print(f"fetched {day}")
+    return dest
+
+
+def completed_sets(train: dict) -> int:
+    return sum(1 for move in train.get("movements", [])
+               for item in move.get("sets", []) if item.get("done"))
+
+
+def summarize_workouts(path: Path) -> str | None:
+    trains = validate_response(json.loads(path.read_text(encoding="utf-8")))["res"]["trains"]
     if not trains:
         return None
     lines = []
-    for t in trains:
-        title = t.get("title") or "Training"
+    for train in trains:
         parts = []
-        for m in t.get("movements", []):
-            done = [s for s in m.get("sets", []) if s.get("done")]
-            if not done:
-                continue
-            grp = {}
-            for s in done:
-                w = s.get("weight") or s.get("weight_kg")
-                if not w and s.get("selfWeight"):
-                    w = "BW"
-                w = str(w or "?")
-                reps = str(s.get("reps") or s.get("time") or s.get("duration_s") or "?")
-                k = (w, reps)
-                grp[k] = grp.get(k, 0) + 1
-            desc = ", ".join(
-                f"{w}{'kg' if w not in ('BW', '?') else ''}x{r}x{c}"
-                for (w, r), c in grp.items())
-            parts.append(f"{m.get('name')}: {desc}")
-        lines.append(f"- {title}: " + ("; ".join(parts) if parts else "no completed sets"))
+        for move in train.get("movements", []):
+            groups: dict[tuple[str, str], int] = {}
+            for item in move.get("sets", []):
+                if not item.get("done"):
+                    continue
+                weight = item.get("weight")
+                if weight is None:
+                    weight = item.get("weight_kg")
+                w = "BW" if weight is None and item.get("selfWeight") else (
+                    "?" if weight is None else f"{weight}kg")
+                reps = next((item[k] for k in ("reps", "time", "duration_s")
+                             if item.get(k) is not None), "?")
+                identity = (str(w), str(reps))
+                groups[identity] = groups.get(identity, 0) + 1
+            if groups:
+                desc = ", ".join(f"{w} x {reps} x {count}"
+                                 for (w, reps), count in groups.items())
+                parts.append(f"{move.get('name') or 'Movement'}: {desc}")
+        lines.append(f"- {train.get('title') or 'Training'}: " +
+                     ("; ".join(parts) if parts else "no completed sets"))
     return "\n".join(lines)
 
 
-def update_daily_md(datestr, training_text):
-    path = os.path.join(REPO, "data", "daily", f"{datestr}.md")
-    if os.path.exists(path):
-        content = open(path).read()
+def update_daily(day: dt.date, training_text: str | None) -> None:
+    path = REPO / "data" / "daily" / f"{day.isoformat()}.md"
+    content = (path.read_text(encoding="utf-8") if path.exists() else
+               f"# {day}\n\n## Sleep\n- (None)\n\n## Meals\n- (None)\n\n"
+               "## Training\n\n## Body metrics\n- (None)\n\n## Notes\n- (None)\n")
+    managed = f"{START_MARKER}\n{training_text or '- No training logged'}\n{END_MARKER}"
+    match = TRAINING_SECTION.search(content)
+    if match:
+        section = match.group()
+        body = section[len("## Training\n"):]
+        if body.count(START_MARKER) != body.count(END_MARKER) or body.count(START_MARKER) > 1:
+            raise ValueError(f"invalid managed markers in {path}")
+        if START_MARKER in body:
+            body = re.sub(re.escape(START_MARKER) + r".*?" + re.escape(END_MARKER),
+                          lambda _: managed, body, count=1, flags=re.S)
+        else:
+            if body.strip() == "- (None)":
+                body = ""
+            body = body.rstrip() + "\n\n" + managed
+        replacement = "## Training\n" + body.strip("\n") + "\n\n"
+        content = content[:match.start()] + replacement + content[match.end():]
     else:
-        content = (f"# {datestr}\n\n## Sleep\n- (None)\n\n## Meals\n- (None)\n\n"
-                   f"## Training\n- (None)\n\n## Body metrics\n- (None)\n\n## Notes\n- (None)\n")
-    new_section = "## Training\n" + (
-        training_text + "\n(source: Xunji API)" if training_text else "- (None)")
-    if "## Training" in content:
-        content = re.sub(r"## Training\n(?:.*\n)*?(?=## |\Z)", new_section + "\n", content)
-    else:
-        content = content.rstrip() + "\n\n" + new_section + "\n"
-    open(path, "w").write(content)
+        content = content.rstrip() + "\n\n## Training\n" + managed + "\n"
+    atomic_write(path, content)
 
 
-def write_report(datestr, training_text):
-    path = os.path.join(REPO, "reports", "daily", f"{datestr}.md")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    body = (f"# Daily report {datestr}\n\n## Training\n"
-            + (training_text or "- No training logged"))
-    open(path, "w").write(body + "\n")
+def write_report(day: dt.date, training_text: str | None) -> None:
+    atomic_write(REPO / "reports" / "daily" / f"{day.isoformat()}.md",
+                 f"# Daily report {day}\n\n## Training\n" +
+                 (training_text or "- No training logged") + "\n")
 
 
-def section_items(content, header):
-    m = re.search(rf"^## {re.escape(header)}\n((?:.*\n)*?)(?=^## |\Z)", content, re.M)
-    if not m:
-        return []
-    return [l.strip() for l in m.group(1).splitlines()
-            if l.strip().startswith("- ") and l.strip() != "- (None)"]
+def section_items(content: str, header: str) -> list[str]:
+    match = re.search(rf"(?ms)^## {re.escape(header)}\n(.*?)(?=^## |\Z)", content)
+    return [line.strip() for line in match.group(1).splitlines()
+            if line.strip().startswith("- ") and line.strip() != "- (None)"] if match else []
 
 
-def build_summary():
-    daily_files = sorted(glob.glob(os.path.join(REPO, "data", "daily", "*.md")))
-    workout_files = sorted(glob.glob(os.path.join(REPO, "data", "workouts", "*.json")))
+def escape_md(text: object) -> str:
+    return str(text).replace("|", r"\|").replace("\n", " ")
 
-    per_date_train = {}
-    train_days = 0
-    total_sets = 0
-    for wf in workout_files:
-        d = os.path.basename(wf)[:10]
+
+def build_summary(as_of: dt.date | None = None) -> None:
+    as_of = as_of or today()
+    workout_files = sorted((REPO / "data" / "workouts").glob("*.json"))
+    daily_files = sorted((REPO / "data" / "daily").glob("*.md"))
+    training_by_day: dict[str, str] = {}
+    sets_count = 0
+    for file in workout_files:
         try:
-            data = json.load(open(wf))
-        except Exception:
+            trains = validate_response(json.loads(file.read_text(encoding="utf-8")))["res"]["trains"]
+        except (ValueError, OSError):
             continue
-        trains = data.get("res", {}).get("trains", [])
         if not trains:
             continue
-        train_days += 1
-        one = []
-        for t in trains:
-            nsets = sum(1 for m in t.get("movements", [])
-                        for s in m.get("sets", []) if s.get("done"))
-            total_sets += nsets
-            one.append(f"{t.get('title') or 'Training'} ({nsets} sets)")
-        per_date_train[d] = "; ".join(one)
+        sets_count += sum(completed_sets(t) for t in trains)
+        training_by_day[file.stem] = "; ".join(
+            f"{t.get('title') or 'Training'} ({completed_sets(t)} sets)" for t in trains)
 
-    dates = sorted({os.path.basename(f)[:10] for f in daily_files})
-    rows = []
-    for d in dates[-14:]:
-        content = open(os.path.join(REPO, "data", "daily", f"{d}.md")).read()
-        tr = per_date_train.get(d, "—")
-        meals = section_items(content, "Meals")
-        meal_txt = f"{len(meals)} logged" if meals else "—"
-        sleep = section_items(content, "Sleep")
-        sleep_txt = sleep[0][2:].strip() if sleep else "—"
-        if len(sleep_txt) > 60:
-            sleep_txt = sleep_txt[:57] + "..."
-        rows.append((d, tr, meal_txt, sleep_txt))
+    dates = sorted(file.stem for file in daily_files)
+    last_7 = [(as_of - dt.timedelta(days=i)).isoformat() for i in range(7)]
+    trained_7 = sum(d in training_by_day for d in last_7)
+    profile = REPO / "profile.md"
+    goal_text = "- (not filled in yet)"
+    if profile.exists():
+        goals = re.search(r"(?ms)^## Current phase goal\n(.*?)(?=^## |\Z)",
+                          profile.read_text(encoding="utf-8"))
+        if goals and goals.group(1).strip():
+            goal_text = goals.group(1).strip()
 
-    last7 = dates[-7:]
-    trained7 = sum(1 for d in last7 if d in per_date_train)
-
-    goal_lines = []
-    try:
-        prof = open(os.path.join(REPO, "profile.md")).read()
-        m = re.search(r"^## Current phase goal\n((?:.*\n)*?)(?=^## |\Z)", prof, re.M)
-        if m:
-            goal_lines = [l.rstrip() for l in m.group(1).splitlines() if l.strip()]
-    except FileNotFoundError:
-        pass
-    goal_txt = "\n".join(goal_lines) if goal_lines else "- (not filled in yet)"
-
-    L = []
-    L.append("# Health Log Summary")
-    L.append(f"_Last updated: {today()}_")
-    L.append("")
-    L.append("## Goals")
-    L.append(goal_txt)
-    L.append("")
-    L.append("## Overall")
-    if dates:
-        L.append(f"- Days logged: {len(dates)} ({dates[0]} → {dates[-1]})")
-    else:
-        L.append("- Days logged: 0")
-    L.append(f"- Training days: {train_days}")
-    L.append(f"- Total completed sets: {total_sets}")
-    L.append(f"- Trained {trained7} of last {len(last7)} days")
-    L.append("")
-    L.append("## Recent days")
-    L.append("")
-    L.append("| Date | Training | Meals | Sleep |")
-    L.append("|------|----------|-------|-------|")
-    for d, tr, meals, sleep in rows:
-        L.append(f"| {d} | {tr} | {meals} | {sleep} |")
-    L.append("")
-    L.append("## Where things live")
-    L.append("")
-    L.append("- Daily logs: `data/daily/`")
-    L.append("- Raw training data: `data/workouts/`")
-    L.append("- Meal records: `data/meals/`")
-    L.append("- Daily reports: `reports/daily/`")
-    L.append("")
-    open(os.path.join(REPO, "SUMMARY.md"), "w").write("\n".join(L))
+    lines = [
+        "# Health Log Summary",
+        f"_Last updated: {as_of.isoformat()}_",
+        "",
+        "## Goals",
+        goal_text, "",
+        "## Overall",
+        f"- Days logged: {len(dates)}" +
+        (f" ({dates[0]} → {dates[-1]})" if dates else ""),
+        f"- Training days: {len(training_by_day)}",
+        f"- Total completed sets: {sets_count}",
+        f"- Trained {trained_7} of the last 7 calendar days",
+        "",
+        "## Recent days", "",
+        "| Date | Training | Meals | Sleep |",
+        "|------|----------|-------|-------|",
+    ]
+    for day in dates[-14:]:
+        day_text = (REPO / "data" / "daily" / f"{day}.md").read_text(encoding="utf-8")
+        meals = section_items(day_text, "Meals")
+        sleep = section_items(day_text, "Sleep")
+        sleep_info = sleep[0][2:].strip()[:60] if sleep else "—"
+        meals_info = f"{len(meals)} logged" if meals else "—"
+        lines.append(f"| {day} | {escape_md(training_by_day.get(day, '—'))} | "
+                     f"{meals_info} | {escape_md(sleep_info)} |")
+    lines += [
+        "",
+        "## Where things live", "",
+        "- Daily logs: data/daily/",
+        "- Raw training data: data/workouts/",
+        "- Meal records: data/meals/",
+        "- Daily reports: reports/daily/",
+        "",
+    ]
+    atomic_write(REPO / "SUMMARY.md", "\n".join(lines))
     print("SUMMARY.md regenerated")
 
 
-def main():
-    if not os.path.exists(KEY_FILE):
-        print(f"API key file not found: {KEY_FILE}\nSee SETUP.md step 3.",
-              file=sys.stderr)
-        return 1
-    key = open(KEY_FILE).read().strip()
-    if not key:
-        print("empty API key", file=sys.stderr)
-        return 1
-    r = sh(["git", "pull", "--rebase"])
-    print("pull:", (r.stdout.strip() or r.stderr.strip())[:120])
-    day = today()
-    ok = True
-    for d in (_date_cmd(-1), day):
-        p = fetch(d, key)
-        if not p:
-            ok = False
-            continue
-        t = summarize(p)
-        update_daily_md(d, t)
-        write_report(d, t)
-    build_summary()
-    r = sh(["git", "status", "--porcelain"])
-    if not r.stdout.strip():
+def git(*args: str) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True)
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        raise RuntimeError(f"git {' '.join(args)} failed: {detail[-1] if detail else result.returncode}")
+    return result
+
+
+def sync_git_pull() -> None:
+    if git("status", "--porcelain").stdout.strip():
+        raise RuntimeError("working tree is not clean; refusing to overwrite local changes")
+    git("pull", "--ff-only")
+
+
+def sync_git_push(day: dt.date) -> None:
+    git("add", "-A", "--", "data/daily", "data/workouts", "reports/daily", "SUMMARY.md")
+    if not git("diff", "--cached", "--name-only").stdout.strip():
         print("no changes")
-        return 0 if ok else 1
-    sh(["git", "add", "-A"])
-    sh(["git", "commit", "-m", f"Daily sync {day}: Xunji training data"])
-    r = sh(["git", "push"])
-    out = (r.stdout + r.stderr).strip()
-    print("push:", out[-200:] if out else "ok")
-    if r.returncode != 0:
-        print("PUSH FAILED", file=sys.stderr)
+        return
+    git("commit", "-m", f"Daily sync {day}: Xunji training data")
+    git("push")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--force-refresh", action="store_true",
+                        help="Refetch workouts even if cached today")
+    parser.add_argument("--no-git", action="store_true",
+                        help="Update local files without git pull/commit/push")
+    args = parser.parse_args(argv)
+    try:
+        if not KEY_FILE.is_file():
+            raise RuntimeError(f"API key file not found: {KEY_FILE}")
+        key = KEY_FILE.read_text(encoding="utf-8").strip()
+        if not key:
+            raise RuntimeError("Xunji API key file is empty")
+        if not args.no_git:
+            sync_git_pull()
+        day = today()
+        fetch_days = [day - dt.timedelta(days=1), day]
+        ok = True
+        for index, d in enumerate(fetch_days):
+            # 16s between potential API reads (Xunji light-read limit: 15s).
+            if index:
+                time.sleep(16)
+            try:
+                raw = fetch_workouts(d, key, force=args.force_refresh)
+                summary = summarize_workouts(raw)
+                update_daily(d, summary)
+                write_report(d, summary)
+            except (RuntimeError, ValueError, OSError) as exc:
+                print(f"WARNING: skipped {d}: {exc}", file=sys.stderr)
+                ok = False
+        build_summary(day)
+        # Never publish a partial sync.
+        if not ok:
+            print("sync incomplete; no git commit/push", file=sys.stderr)
+            return 1
+        if not args.no_git:
+            sync_git_push(day)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    return 0 if ok else 1
+    return 0
 
 
 if __name__ == "__main__":
