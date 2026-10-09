@@ -46,3 +46,13 @@ existing logs; SynFit is the app's English name.
 - Derive trends from dated observations and state the analysis window.
 - Explain gaps in data coverage and avoid clinical diagnoses.
 - Keep advice separate from underlying observations.
+
+## Task-specific health coaching workflow
+
+When asked to log a meal, review a workout, summarize sleep, or produce
+daily/weekly health reviews, follow the canonical
+[Health Log Coach skill](.agents/skills/health-log-coach/SKILL.md).
+The matching Claude Code entry point is in
+[.claude/skills/health-log-coach/](.claude/skills/health-log-coach/SKILL.md).
+The skill is opt-in by user request; it does not authorize autonomous
+scheduling, clinical judgments or third-party API writes.
