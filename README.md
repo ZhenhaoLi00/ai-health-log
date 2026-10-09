@@ -1,5 +1,7 @@
 # AI Health Log
 
+[中文](README.zh-CN.md)
+
 A personal health data hub designed to be shared across multiple AI assistants
 (Muse, ChatGPT, Codex, ...). One repo holds your training, meals, sleep and
 body metrics; any AI can read from it and write to it following the conventions
