@@ -1,0 +1,5 @@
+# Local config / secrets (never commit)
+.config/
+*.key
+*.pem
+.env
