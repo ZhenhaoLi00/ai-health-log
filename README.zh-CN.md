@@ -65,6 +65,29 @@ scripts/             自动化同步脚本
 5. **重新生成，不要手动修改。** `SUMMARY.md` 和 `reports/daily/` 由同步脚本生成。
 6. **写回第三方 API 前必须确认。** 先展示修改摘要，获得用户明确同意后再操作。
 
+## AI 健康管理 Skill（可选）
+
+本模板已经提供 [AGENTS.md](AGENTS.md)，用于约束 AI 的数据读写、
+隐私保护和协作方式。另外新增了可按需调用的
+[Health Log Coach Skill](.agents/skills/health-log-coach/SKILL.md)，
+指导 AI 记录饮食、分析 SynFit 训练、汇总睡眠数据，以及生成每日/每周健康回顾。
+它借鉴了访谈中的工作流，但不采用未经验证的健康结论。
+
+Codex 可从 `.agents/skills/` 发现该 Skill；Claude Code 的入口位于
+`.claude/skills/`。Muse、ChatGPT 等其他助手可在获得相应文件访问权限后
+按照同一套说明执行。
+
+**直接告诉 AI（提示词保持英文）：**
+
+~~~text
+Read AGENTS.md and .agents/skills/health-log-coach/SKILL.md in my private
+health-log repository. Follow the skill to review my last seven calendar days.
+Use only the data available, label estimates and missing records, and propose
+changes before writing anything.
+~~~
+
+请只在包含真实记录的**私有仓库**中使用该流程，不要把个人健康数据提交到公开模板。
+
 ## 使用 AI 构建本地 Dashboard（可选）
 
 你可以让 **Muse、Claude Code、Codex 或其他能访问本地文件的编程助手**，将私有健康仓库中的数据转换为可视化 Dashboard。无须依赖在线仪表盘服务：私有 Git 仓库继续作为数据来源，Dashboard 在本地读取文件。
