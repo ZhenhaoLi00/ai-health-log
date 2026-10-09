@@ -80,6 +80,31 @@ All text in this repo is English by convention.
 6. **Confirm before writing back** to any third-party API: show the change
    summary first and wait for the user's OK.
 
+## AI health coaching skill (optional)
+
+This template already includes [AGENTS.md](AGENTS.md) for repository-wide
+data safety and collaboration rules. It also provides a task-specific
+[Health Log Coach skill](.agents/skills/health-log-coach/SKILL.md) for logging
+meals, reviewing SynFit workouts, summarizing wearable sleep data, and producing
+daily or weekly health reviews. The workflow is inspired by the interview,
+without adopting unverified health claims.
+
+Codex can discover the skill from `.agents/skills/`; Claude Code has an entry
+point under `.claude/skills/`. Other assistants (including Muse and ChatGPT)
+can follow it when you give them access to the file.
+
+To invoke it manually, tell your assistant:
+
+~~~text
+Read AGENTS.md and .agents/skills/health-log-coach/SKILL.md in my private
+health-log repository. Follow the skill to review my last seven calendar days.
+Use only the data available, label estimates and missing records, and propose
+changes before writing anything.
+~~~
+
+Keep real health data in your **private** copy of the repository, never in
+this public template.
+
 ## Build a local dashboard with AI (optional)
 
 You can ask **Muse, Claude Code, Codex, or another coding assistant with access
