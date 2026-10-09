@@ -7,10 +7,12 @@ This repository is a personal health-data store, **not** a place to invent obser
 2. Treat imported records as source data. Never replace real measurements with estimates.
 3. Store all access credentials outside the repository. Do not print tokens or private responses in logs.
 4. Never push real personal health data to a public repository; use a private copy.
+   The sync script verifies all GitHub origin push URLs before writing/pushing
+   (requires an authenticated GitHub CLI or GitHub API token).
 
 ## Ownership and provenance
-- data/workouts/YYYY-MM-DD.json: raw Xunji response, owned by sync script; do not hand-edit.
-- data/daily/YYYY-MM-DD.md: human/agent notes plus an automatically owned Xunji block.
+- data/workouts/YYYY-MM-DD.json: raw SynFit response, owned by sync script; do not hand-edit.
+- data/daily/YYYY-MM-DD.md: human/agent notes plus an automatically owned SynFit block.
 - reports/daily/ and SUMMARY.md: generated outputs; do not hand-edit.
 - data/meals/: meal entries authored by the user or an assistant.
 - data/metrics/: body metrics from an identified source.
@@ -22,11 +24,13 @@ The two markers inside a daily Training section delimit an auto-managed block:
 <!-- END XUNJI SYNC -->
 
 Preserve everything outside these markers. Never edit or delete the markers manually.
+The `XUNJI SYNC` marker spelling is a legacy internal identifier retained for
+existing logs; SynFit is the app's English name.
 
 ## Record conventions
 - Use ISO 8601 dates (YYYY-MM-DD) and explicit timezone for timestamps.
 - Record measurement units: kg, cm, hours, kcal, and g.
-- Include source (e.g. Xunji, Apple Health, user), timestamp and confidence/estimated flag when relevant.
+- Include source (e.g. SynFit, Apple Health, user), timestamp and confidence/estimated flag when relevant.
 - For meals, distinguish estimates from verified nutrition-label values.
 - Missing data means unknown, not zero. Do not claim a rest day because there is no workout record.
 - Check whether a record already exists before adding another one for the same event.
