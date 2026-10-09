@@ -12,6 +12,20 @@ below — so you never have to repeat your context to a new assistant.
 > API keys or tokens; see [SETUP.md](SETUP.md). The sync script checks every
 > GitHub push destination and refuses to push unless each is verified private.
 
+## A starting point, not a finished app
+
+AI Health Log is intentionally simple. It is **not** a feature-packed health
+app or a one-size-fits-all AI coach. It is a lightweight starting framework:
+a clear folder structure, shared data conventions, a basic sync script, and an
+optional agent skill. The goal is to make the **first step** easier, not to
+decide what your health workflow should look like.
+
+In the AI era, you can ask tools like Muse, Claude Code, or Codex to create
+your own skills, connect the data sources you use, or build a local dashboard
+around your goals. You do not have to wait for this template to implement
+every feature. **Start with the skeleton, then make it yours.** Extensions
+still need appropriate setup, testing, and privacy review.
+
 ## Set up with your AI
 
 Copy everything between the lines and paste it into any AI assistant
