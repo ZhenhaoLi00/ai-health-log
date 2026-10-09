@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Sync Xunji workouts into a private, AI-readable health-log repository.
+"""Sync SynFit workouts into a private, AI-readable health-log repository.
 
-Only the fenced Xunji block inside a daily Training section is managed by
+Only the fenced SynFit block inside a daily Training section is managed by
 this script. User-authored notes and other sections are preserved.
 """
 from __future__ import annotations
@@ -11,6 +11,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import shutil
 import re
 import subprocess
 import sys
@@ -18,12 +19,13 @@ import tempfile
 import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 REPO = Path(os.environ.get("HEALTH_LOG_REPO", Path(__file__).resolve().parent.parent)).expanduser().resolve()
 KEY_FILE = Path(os.environ.get("XUNJI_API_KEY_FILE", "~/.config/xunji/api_key")).expanduser()
 TIMEZONE = os.environ.get("HEALTH_LOG_TZ", "")
-API = "https://trains.xunjiapp.cn/api_trains_for_llm_v2"
+API = "https://trains.xunjiapp.cn/api_trains_for_llm_v2"  # SynFit legacy API hostname
 START_MARKER = "<!-- BEGIN XUNJI SYNC -->"
 END_MARKER = "<!-- END XUNJI SYNC -->"
 TRAINING_SECTION = re.compile(r"(?ms)^## Training\n.*?(?=^## |\Z)")
@@ -64,19 +66,36 @@ def validate_response(data: object) -> dict:
     return data
 
 
+def cache_metadata_path(day: dt.date) -> Path:
+    return REPO / "data" / "workouts" / f"{day.isoformat()}.meta.json"
+
+
+def cache_is_fresh(day: dt.date) -> bool:
+    """Use explicit fetch time, not Git checkout / file modification time."""
+    dest = REPO / "data" / "workouts" / f"{day.isoformat()}.json"
+    metadata_file = cache_metadata_path(day)
+    if not dest.is_file() or not metadata_file.is_file():
+        return False
+    try:
+        metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+        fetched_at = dt.datetime.fromisoformat(metadata["fetched_at"])
+        if fetched_at.tzinfo is None or fetched_at.utcoffset() is None:
+            return False
+        if metadata.get("date") != day.isoformat():
+            return False
+        if fetched_at.astimezone(local_now().tzinfo).date() != today():
+            return False
+        validate_response(json.loads(dest.read_text(encoding="utf-8")))
+        return True
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+
+
 def fetch_workouts(day: dt.date, key: str, force: bool = False) -> Path:
     dest = REPO / "data" / "workouts" / f"{day.isoformat()}.json"
-    if dest.exists() and not force:
-        cached_day = dt.datetime.fromtimestamp(dest.stat().st_mtime,
-                                                tz=local_now().tzinfo).date()
-        if cached_day == today():
-            try:
-                validate_response(json.loads(dest.read_text(encoding="utf-8")))
-            except ValueError:
-                print(f"invalid cache, refreshing {day}")
-            else:
-                print(f"cached {day}")
-                return dest
+    if not force and cache_is_fresh(day):
+        print(f"cached {day}")
+        return dest
 
     request_body = json.dumps({
         "schema_version": "train_open_api_v2",
@@ -89,7 +108,6 @@ def fetch_workouts(day: dt.date, key: str, force: bool = False) -> Path:
         "Accept": "application/json",
         "Accept-Encoding": "gzip",
     })
-    # urllib avoids exposing the API token through curl command-line arguments.
     try:
         with urlopen(request, timeout=30) as response:
             raw = response.read()
@@ -98,13 +116,19 @@ def fetch_workouts(day: dt.date, key: str, force: bool = False) -> Path:
                 raw = gzip.decompress(raw)
             data = validate_response(json.loads(raw.decode("utf-8")))
     except (HTTPError, URLError, OSError, ValueError, UnicodeError) as exc:
-        # Do not print the token, request headers, or raw server responses.
-        raise RuntimeError(f"Xunji fetch failed for {day}: {type(exc).__name__}") from None
+        raise RuntimeError(f"SynFit fetch failed for {day}: {type(exc).__name__}") from None
 
+    # Write the raw API record first; a missing metadata file forces a
+    # re-fetch rather than accepting a partially updated cache as fresh.
     atomic_write(dest, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    metadata = {
+        "date": day.isoformat(),
+        "fetched_at": local_now().astimezone(dt.timezone.utc).isoformat(),
+        "source": "SynFit",
+    }
+    atomic_write(cache_metadata_path(day), json.dumps(metadata, indent=2) + "\n")
     print(f"fetched {day}")
     return dest
-
 
 def completed_sets(train: dict) -> int:
     return sum(1 for move in train.get("movements", [])
@@ -185,7 +209,7 @@ def escape_md(text: object) -> str:
 
 def build_summary(as_of: dt.date | None = None) -> None:
     as_of = as_of or today()
-    workout_files = sorted((REPO / "data" / "workouts").glob("*.json"))
+    workout_files = sorted((REPO / "data" / "workouts").glob("????-??-??.json"))
     daily_files = sorted((REPO / "data" / "daily").glob("*.md"))
     training_by_day: dict[str, str] = {}
     sets_count = 0
@@ -257,6 +281,68 @@ def git(*args: str) -> subprocess.CompletedProcess[str]:
     return result
 
 
+def parse_github_remote(remote: str) -> str:
+    """Accept GitHub HTTPS/SSH remotes only; return owner/repo."""
+    remote = remote.strip()
+    if remote.startswith("git@github.com:"):
+        path = remote[len("git@github.com:"):]
+    elif remote.startswith("ssh://git@github.com/"):
+        path = remote[len("ssh://git@github.com/"):]
+    else:
+        parsed = urlsplit(remote)
+        if (parsed.scheme != "https" or parsed.hostname != "github.com"
+                or parsed.username or parsed.password or parsed.port is not None):
+            raise RuntimeError("Push remote must be a GitHub HTTPS or SSH URL")
+        path = parsed.path.lstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", path):
+        raise RuntimeError("Cannot identify GitHub repository from push remote")
+    return path
+
+
+def github_api_token() -> str:
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        return token.strip()
+    if shutil.which("gh"):
+        result = subprocess.run(["gh", "auth", "token"], capture_output=True,
+                                text=True, timeout=15)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    raise RuntimeError(
+        "Private repository visibility cannot be verified. Authenticate "
+        "GitHub CLI (gh auth login) or provide GH_TOKEN/GITHUB_TOKEN "
+        "with access to the private repository. No push attempted."
+    )
+
+
+def assert_private_push_remote() -> None:
+    """Fail closed unless GitHub confirms the target of 'git push' is private."""
+    remote = git("remote", "get-url", "--push", "origin").stdout.strip()
+    name = parse_github_remote(remote)
+    token = github_api_token()
+    request = Request(f"https://api.github.com/repos/{name}", headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "ai-health-log-sync",
+    })
+    try:
+        with urlopen(request, timeout=15) as response:
+            metadata = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, OSError, ValueError, UnicodeError):
+        raise RuntimeError(
+            f"Cannot verify that GitHub push destination {name} is private; "
+            "check GitHub authentication/network access. No push attempted."
+        ) from None
+    if not isinstance(metadata, dict) or metadata.get("private") is not True:
+        raise RuntimeError(
+            f"Refusing to push health data: GitHub repository {name} "
+            "is public or its visibility is unverified."
+        )
+    print(f"verified private GitHub push destination: {name}")
+
+
 def sync_git_pull() -> None:
     if git("status", "--porcelain").stdout.strip():
         raise RuntimeError("working tree is not clean; refusing to overwrite local changes")
@@ -264,13 +350,14 @@ def sync_git_pull() -> None:
 
 
 def sync_git_push(day: dt.date) -> None:
+    # Recheck immediately before staging/committing in case remote changed.
+    assert_private_push_remote()
     git("add", "-A", "--", "data/daily", "data/workouts", "reports/daily", "SUMMARY.md")
     if not git("diff", "--cached", "--name-only").stdout.strip():
         print("no changes")
         return
-    git("commit", "-m", f"Daily sync {day}: Xunji training data")
+    git("commit", "-m", f"Daily sync {day}: SynFit training data")
     git("push")
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -284,8 +371,9 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(f"API key file not found: {KEY_FILE}")
         key = KEY_FILE.read_text(encoding="utf-8").strip()
         if not key:
-            raise RuntimeError("Xunji API key file is empty")
+            raise RuntimeError("SynFit API key file is empty")
         if not args.no_git:
+            assert_private_push_remote()  # before touching personal files
             sync_git_pull()
         day = today()
         fetch_days = [day - dt.timedelta(days=1), day]
