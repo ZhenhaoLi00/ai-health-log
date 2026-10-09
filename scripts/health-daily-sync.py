@@ -318,30 +318,32 @@ def github_api_token() -> str:
 
 
 def assert_private_push_remote() -> None:
-    """Fail closed unless GitHub confirms the target of 'git push' is private."""
-    remote = git("remote", "get-url", "--push", "origin").stdout.strip()
-    name = parse_github_remote(remote)
+    """Fail closed unless every origin push URL is confirmed private by GitHub."""
+    remotes = git("remote", "get-url", "--push", "--all", "origin").stdout.splitlines()
+    if not remotes:
+        raise RuntimeError("No GitHub origin push URL configured; refusing sync")
+    names = [parse_github_remote(url) for url in remotes]
     token = github_api_token()
-    request = Request(f"https://api.github.com/repos/{name}", headers={
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "ai-health-log-sync",
-    })
-    try:
-        with urlopen(request, timeout=15) as response:
-            metadata = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, OSError, ValueError, UnicodeError):
-        raise RuntimeError(
-            f"Cannot verify that GitHub push destination {name} is private; "
-            "check GitHub authentication/network access. No push attempted."
-        ) from None
-    if not isinstance(metadata, dict) or metadata.get("private") is not True:
-        raise RuntimeError(
-            f"Refusing to push health data: GitHub repository {name} "
-            "is public or its visibility is unverified."
-        )
-    print(f"verified private GitHub push destination: {name}")
-
+    for name in names:
+        request = Request(f"https://api.github.com/repos/{name}", headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "ai-health-log-sync",
+        })
+        try:
+            with urlopen(request, timeout=15) as response:
+                metadata = json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, OSError, ValueError, UnicodeError):
+            raise RuntimeError(
+                f"Cannot verify that GitHub push destination {name} is private; "
+                "check GitHub authentication/network access. No push attempted."
+            ) from None
+        if not isinstance(metadata, dict) or metadata.get("private") is not True:
+            raise RuntimeError(
+                f"Refusing to push health data: GitHub repository {name} "
+                "is public or its visibility is unverified."
+            )
+        print(f"verified private GitHub push destination: {name}")
 
 def sync_git_pull() -> None:
     if git("status", "--porcelain").stdout.strip():
@@ -357,7 +359,8 @@ def sync_git_push(day: dt.date) -> None:
         print("no changes")
         return
     git("commit", "-m", f"Daily sync {day}: SynFit training data")
-    git("push")
+    branch = git("symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    git("push", "origin", f"HEAD:refs/heads/{branch}")
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
